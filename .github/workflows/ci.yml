@@ -6,6 +6,7 @@ on:
   push:
     branches: [master]
   schedule:
+    # Run off-peak and away from GitHub Actions' start-of-hour load spike.
     - cron: "17 3 * * *"
 
 jobs:
