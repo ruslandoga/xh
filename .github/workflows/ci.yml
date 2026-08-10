@@ -6,7 +6,7 @@ on:
   push:
     branches: [master]
   schedule:
-    - cron: "42 9 * * *"
+    - cron: "17 3 * * *"
 
 jobs:
   test:
@@ -19,13 +19,17 @@ jobs:
     strategy:
       matrix:
         include:
-          # a pre-JSON ClickHouse version
-          # https://github.com/plausible/ch/issues/273
+          # oldest supported releases (roughly two years)
           - elixir: 1.18
             otp: 27
-            clickhouse: 24.5.4.49
+            clickhouse: 24.5
 
-          # the latest elixir/erlang version with all static checks
+          # previous release generation
+          - elixir: 1.19
+            otp: 28
+            clickhouse: 25.5
+
+          # latest releases with all static checks
           - elixir: ">0"
             otp: ">0"
             clickhouse: latest
