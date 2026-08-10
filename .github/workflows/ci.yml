@@ -4,7 +4,7 @@ on:
   pull_request:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [main]
   schedule:
     # Run off-peak and away from GitHub Actions' start-of-hour load spike.
     - cron: "17 3 * * *"
@@ -69,7 +69,7 @@ jobs:
           key: test-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
             test-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}-
-            test-${{ steps.beam.outputs.elixir-version }}-refs/heads/master-
+            test-${{ steps.beam.outputs.elixir-version }}-refs/heads/main-
 
       - run: mix deps.get --only $MIX_ENV
         if: ${{ !matrix.lint }}
@@ -94,7 +94,7 @@ jobs:
           path: plts
           key: plts-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}
           restore-keys: |
-            plts-${{ steps.beam.outputs.elixir-version }}-refs/heads/master
+            plts-${{ steps.beam.outputs.elixir-version }}-refs/heads/main
 
       - run: mix dialyzer --format github
         if: ${{ matrix.dialyzer }}
