@@ -1,18 +1,5 @@
 defmodule Xh do
   @moduledoc """
-  Documentation for `Xh`.
+  A ClickHouse HTTP client for Elixir.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> Xh.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end
