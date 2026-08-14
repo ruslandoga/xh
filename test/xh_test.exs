@@ -1,11 +1,11 @@
 defmodule XhTest do
   use ExUnit.Case, async: true
 
-  @request_timeout 1_000
+  @query_timeout 1_000
   @clickhouse_url "http://localhost:8123"
   @client_port_query "SELECT port FROM system.processes WHERE query_id=currentQueryID() FORMAT TabSeparated"
 
-  test "real ClickHouse requests reuse the same HTTP connection" do
+  test "real ClickHouse queries reuse the same HTTP connection" do
     pool =
       start_supervised!(
         {Xh, url: @clickhouse_url, pool_size: 1, worker_idle_timeout: :infinity},
@@ -28,10 +28,9 @@ defmodule XhTest do
     first_port = clickhouse_client_port(pool)
 
     assert {:ok, 200, headers, body} =
-             Xh.query(
-               pool,
-               {"POST", "/", [{"connection", "close"}], @client_port_query},
-               @request_timeout
+             Xh.query(pool, @client_port_query, %{},
+               headers: [{"connection", "close"}],
+               timeout: @query_timeout
              )
 
     assert String.trim(body) == first_port
@@ -40,7 +39,7 @@ defmodule XhTest do
     refute clickhouse_client_port(pool) == first_port
   end
 
-  test "a timed-out real ClickHouse request is removed before the next request" do
+  test "a timed-out real ClickHouse query is removed before the next query" do
     pool =
       start_supervised!(
         {Xh, url: @clickhouse_url, pool_size: 1, worker_idle_timeout: :infinity},
@@ -50,12 +49,12 @@ defmodule XhTest do
     first_port = clickhouse_client_port(pool)
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.query(pool, {"POST", "/", [], "SELECT sleep(0.2)"}, 20)
+             Xh.query(pool, "SELECT sleep(0.2)", %{}, timeout: 20)
 
     refute clickhouse_client_port(pool) == first_port
   end
 
-  test "the pool is lazy and a second request reuses its connection" do
+  test "the pool is lazy and a second query reuses its connection" do
     test_process = self()
 
     handler = fn connection_id, request ->
@@ -79,16 +78,25 @@ defmodule XhTest do
 
     refute_receive {:accepted, ^server, _connection_id}, 50
 
-    first = query_async(pool, "/insert?batch=1")
+    first =
+      query_async(pool, ["INSERT INTO events FORMAT CSV\n" | "1,first\n"], settings: [batch: 1])
 
     assert_receive {:accepted, ^server, 1}
-    assert_receive {:request, ^server, 1, %{target: "/clickhouse/insert?batch=1"}}
+
+    assert_receive {:request, ^server, 1,
+                    %{
+                      method: "POST",
+                      target: "/clickhouse/?batch=1",
+                      body: "INSERT INTO events FORMAT CSV\n1,first\n"
+                    }}
+
     send(server, {:respond, 1, "first"})
     assert Task.await(first) == {:ok, 200, [{"x-test", "yes"}, {"content-length", "5"}], "first"}
 
-    second = query_async(pool, "/insert?batch=2")
+    second = query_async(pool, "second", settings: [batch: 2])
 
-    assert_receive {:request, ^server, 1, %{target: "/clickhouse/insert?batch=2"}}
+    assert_receive {:request, ^server, 1, %{target: "/clickhouse/?batch=2", body: "second"}}
+
     refute_receive {:accepted, ^server, 2}, 50
     send(server, {:respond, 1, "second"})
     assert {:ok, 200, _headers, "second"} = Task.await(second)
@@ -109,14 +117,14 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    failed = query_async(pool, "/closed")
-    assert_receive {:request, ^server, 1, %{target: "/closed"}}
+    failed = query_async(pool, "closed")
+    assert_receive {:request, ^server, 1, %{target: "/", body: "closed"}}
     send(server, {:close, 1})
     assert {:error, %Mint.TransportError{reason: :closed}} = Task.await(failed)
 
-    successful = query_async(pool, "/fresh")
+    successful = query_async(pool, "fresh")
     assert_receive {:accepted, ^server, 2}
-    assert_receive {:request, ^server, 2, %{target: "/fresh"}}
+    assert_receive {:request, ^server, 2, %{target: "/", body: "fresh"}}
     send(server, {:respond, 2, "fresh"})
     assert {:ok, 200, _headers, "fresh"} = Task.await(successful)
   end
@@ -136,15 +144,15 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    failed = query_async(pool, "/timeout", 40)
-    assert_receive {:request, ^server, 1, %{target: "/timeout"}}
+    failed = query_async(pool, "timeout", timeout: 40)
+    assert_receive {:request, ^server, 1, %{target: "/", body: "timeout"}}
     assert {:error, %Mint.TransportError{reason: :timeout}} = Task.await(failed)
     send(server, {:await_close, 1})
     assert_receive {:connection_closed, ^server, 1}
 
-    successful = query_async(pool, "/fresh")
+    successful = query_async(pool, "fresh")
     assert_receive {:accepted, ^server, 2}
-    assert_receive {:request, ^server, 2, %{target: "/fresh"}}
+    assert_receive {:request, ^server, 2, %{target: "/", body: "fresh"}}
     send(server, {:respond, 2, "fresh"})
     assert {:ok, 200, _headers, "fresh"} = Task.await(successful)
   end
@@ -163,15 +171,15 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    checked_out = query_async(pool, "/held")
-    assert_receive {:request, ^server, 1, %{target: "/held"}}
+    checked_out = query_async(pool, "held")
+    assert_receive {:request, ^server, 1, %{target: "/", body: "held"}}
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.query(pool, {"POST", "/queued", [], "payload"}, 20)
+             Xh.query(pool, "queued", %{}, timeout: 20)
 
     send(server, {:respond, 1, "done"})
     assert {:ok, 200, _headers, "done"} = Task.await(checked_out)
-    refute_receive {:request, ^server, _connection_id, %{target: "/queued"}}, 50
+    refute_receive {:request, ^server, _connection_id, %{body: "queued"}}, 50
   end
 
   test "the deadline bounds request transmission" do
@@ -187,7 +195,7 @@ defmodule XhTest do
     started_at = System.monotonic_time(:millisecond)
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.query(pool, {"POST", "/stalled", [], body}, 40)
+             Xh.query(pool, body, %{}, timeout: 40)
 
     assert_receive {:accepted, ^server}
     assert System.monotonic_time(:millisecond) - started_at < 500
@@ -205,9 +213,9 @@ defmodule XhTest do
     {:ok, pool} = Xh.start_link(url: url, pool_size: 1, worker_idle_timeout: :infinity)
 
     assert {:ok, 204, _headers, ""} =
-             Xh.query(pool, {"POST", "/ack", [], "payload"}, @request_timeout)
+             Xh.query(pool, "payload", %{}, timeout: @query_timeout)
 
-    assert_receive {:request, ^server, 1, %{target: "/ack", body: "payload"}}
+    assert_receive {:request, ^server, 1, %{target: "/", body: "payload"}}
     assert :ok = Xh.stop(pool)
     assert_receive {:connection_closed, ^server, 1}
   end
@@ -237,17 +245,20 @@ defmodule XhTest do
     assert Process.whereis(name) == pool
     refute_receive {:accepted, ^server, _connection_id}, 20
 
-    assert {:ok, 200, _headers, "named"} =
-             Xh.query(name, {"POST", "/named", [], ""}, @request_timeout)
+    assert {:ok, 200, _headers, "named"} = Xh.query(name, "")
   end
 
-  defp query_async(pool, target, timeout \\ @request_timeout) do
-    Task.async(fn -> Xh.query(pool, {"POST", target, [], "payload"}, timeout) end)
+  defp query_async(pool, statement, options \\ []) do
+    options = Keyword.put_new(options, :timeout, @query_timeout)
+
+    Task.async(fn ->
+      Xh.query(pool, statement, %{}, options)
+    end)
   end
 
   defp clickhouse_client_port(pool) do
     assert {:ok, 200, _headers, body} =
-             Xh.query(pool, {"POST", "/", [], @client_port_query}, @request_timeout)
+             Xh.query(pool, @client_port_query, %{}, timeout: @query_timeout)
 
     String.trim(body)
   end

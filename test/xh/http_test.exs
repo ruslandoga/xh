@@ -99,7 +99,12 @@ defmodule Xh.HTTPTest do
       {"output_format_json_quote_64bit_integers", false}
     ]
 
-    assert %{status: 200, body: body} = query(pool, statement, params, settings)
+    assert {:ok, 200, _headers, body} =
+             Xh.query(pool, statement, params,
+               settings: settings,
+               timeout: to_timeout(second: 5)
+             )
+
     assert body == ~s({"ok":1,"count":9007199254740993}\n)
   end
 
@@ -109,25 +114,16 @@ defmodule Xh.HTTPTest do
             string <- string([?\t, ?\n, ?\\, 32..126, 0x400..0x4FF], max_length: 32),
             max_runs: 25
           ) do
-      response =
-        query(
-          pool,
-          "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated",
-          %{"integer" => integer, "string" => string}
-        )
+      assert {:ok, 200, _headers, body} =
+               Xh.query(
+                 pool,
+                 "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated",
+                 %{"integer" => integer, "string" => string},
+                 timeout: to_timeout(second: 5)
+               )
 
-      assert %{status: 200, body: body} = response
       assert body == "#{integer}\t#{Base.encode16(string)}\n"
     end
-  end
-
-  defp query(pool, statement, params, settings \\ []) do
-    target = HTTP.query_path(params, settings)
-
-    {:ok, status, headers, body} =
-      Xh.query(pool, {"POST", target, [], statement}, to_timeout(second: 5))
-
-    %{status: status, headers: headers, body: body}
   end
 
   defp decode_query(target) do

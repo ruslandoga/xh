@@ -5,13 +5,15 @@ defmodule Xh do
   Each pool is bound to the origin configured by `:url`. Connections are opened
   lazily, used by one query at a time, and reused while they remain healthy.
 
-  `query/3` buffers the complete response. It is intended for small insert
+  `query/2` buffers the complete response. It is intended for small insert
   acknowledgements, not large query results, and never retries a query.
   """
 
   @behaviour NimblePool
 
   alias Xh.HTTP
+
+  @query_timeout to_timeout(second: 30)
 
   @start_options_schema [
     name: [
@@ -43,9 +45,17 @@ defmodule Xh do
   @typedoc "Options accepted by `start_link/1`."
   @type start_option :: unquote(NimbleOptions.option_typespec(@start_options_schema))
 
-  @typedoc "A raw HTTP query. The target is relative to the path in the pool URL."
-  @type query ::
-          {method :: String.t(), target :: String.t(), Mint.Types.headers(), iodata() | nil}
+  @typedoc "A ClickHouse SQL statement, optionally followed by encoded data."
+  @type query_statement :: iodata()
+
+  @typedoc "Named ClickHouse query parameters."
+  @type query_params :: %{String.t() => term()}
+
+  @typedoc "Options accepted by `query/4`."
+  @type query_option ::
+          {:headers, Mint.Types.headers()}
+          | {:settings, Enumerable.t()}
+          | {:timeout, timeout() | HTTP.deadline()}
 
   @typedoc "A fully buffered raw HTTP response."
   @type response ::
@@ -117,19 +127,34 @@ defmodule Xh do
   end
 
   @doc """
-  Executes one raw ClickHouse HTTP query and buffers its complete response.
+  Executes a ClickHouse query and buffers its complete HTTP response.
 
-  `timeout_or_deadline` is either a relative timeout or the absolute monotonic
-  deadline returned by `Xh.HTTP.to_deadline/1`. The same deadline covers pool
-  checkout, connection establishment, query transmission, and response
-  receipt.
+  `statement` may be a SQL string or iodata containing SQL followed by encoded
+  insert data. `params` are named query parameters. Supported options are:
+
+    * `:headers` - HTTP headers passed to Mint.
+    * `:settings` - ClickHouse settings added to the query string.
+    * `:timeout` - A relative timeout or absolute monotonic deadline; defaults
+      to 30 seconds.
+
+  The same deadline covers pool checkout, connection establishment, query
+  transmission, and response receipt.
 
   The query is never retried. If its connection fails or times out, that
   connection is closed and removed from the pool.
   """
-  @spec query(NimblePool.pool(), query(), timeout() | HTTP.deadline()) :: response()
-  def query(pool, {method, target, headers, body}, timeout_or_deadline)
-      when is_binary(method) and is_binary(target) and is_list(headers) do
+  @spec query(NimblePool.pool(), query_statement(), query_params(), [query_option()]) ::
+          response()
+  def query(pool, statement, params \\ %{}, options \\ [])
+      when (is_binary(statement) or is_list(statement)) and is_map(params) and is_list(options) do
+    target = HTTP.query_path(params, Keyword.get(options, :settings, []))
+    headers = Keyword.get(options, :headers, [])
+    timeout_or_deadline = Keyword.get(options, :timeout, @query_timeout)
+
+    execute(pool, target, headers, statement, timeout_or_deadline)
+  end
+
+  defp execute(pool, target, headers, body, timeout_or_deadline) do
     deadline = HTTP.to_deadline(timeout_or_deadline)
     checkout_timeout = HTTP.to_timeout(deadline)
 
@@ -138,7 +163,7 @@ defmodule Xh do
         pool,
         :request,
         fn from, conn_or_endpoint ->
-          case exchange(from, conn_or_endpoint, method, target, headers, body, deadline) do
+          case exchange(from, conn_or_endpoint, "POST", target, headers, body, deadline) do
             {:ok, conn, status, response_headers, response_body} ->
               state =
                 if Mint.HTTP1.open?(conn) do
