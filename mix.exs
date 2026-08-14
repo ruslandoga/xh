@@ -28,10 +28,12 @@ defmodule Xh.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:decimal, "~> 3.0"},
       {:mint, "~> 1.8"},
       {:nimble_pool, "~> 1.1"},
       {:nimble_options, "~> 1.1"},
-      {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false}
+      {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false},
+      {:stream_data, "~> 1.1", only: :test}
     ]
   end
 
