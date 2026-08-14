@@ -9,57 +9,19 @@ defmodule Xh.HTTPTest do
     assert HTTP.query_path(%{}, readonly: 1) == "/?readonly=1"
   end
 
-  test "keeps settings distinct from named SQL parameters" do
-    target =
-      HTTP.query_path(
-        %{async_insert: 7},
-        async_insert: 1,
-        wait_for_async_insert: true
-      )
-
-    assert decode_query(target) == %{
-             "param_async_insert" => "7",
-             "async_insert" => "1",
-             "wait_for_async_insert" => "true"
-           }
-  end
-
-  test "encodes current Ch scalar parameter values" do
+  test "encodes temporal edge cases" do
     params = %{
-      decimal: Decimal.new("1.2300"),
-      date: ~D[2026-08-14],
-      naive: ~N[2026-08-14 12:34:56],
       time: ~T[12:34:56.123],
       epoch: ~U[1970-01-01 00:00:00Z],
       before_epoch: ~U[1969-12-31 23:59:59Z],
-      fractional: ~U[1970-01-01 00:00:00.001Z],
-      unicode: "Привет, 世界 👋"
+      fractional: ~U[1970-01-01 00:00:00.001Z]
     }
 
     assert HTTP.query_path(params) |> decode_query() == %{
-             "param_decimal" => "1.2300",
-             "param_date" => "2026-08-14",
-             "param_naive" => "2026-08-14T12:34:56",
              "param_time" => "12:34:56.123",
              "param_epoch" => "00000",
              "param_before_epoch" => "-00001",
-             "param_fractional" => "0.001",
-             "param_unicode" => "Привет, 世界 👋"
-           }
-  end
-
-  test "encodes collection parameter values" do
-    target =
-      HTTP.query_path(%{
-        array: ["O'Reilly", nil, ~D[2026-08-14]],
-        tuple: {1, true},
-        map: %{"key" => "value"}
-      })
-
-    assert decode_query(target) == %{
-             "param_array" => "['O''Reilly',null,'2026-08-14']",
-             "param_tuple" => "(1,true)",
-             "param_map" => "{'key':'value'}"
+             "param_fractional" => "0.001"
            }
   end
 
@@ -92,6 +54,96 @@ defmodule Xh.HTTPTest do
 
   test "expired deadlines return zero" do
     assert HTTP.to_timeout({:deadline, System.monotonic_time(:millisecond) - 1}) == 0
+  end
+
+  test "ClickHouse accepts the generated query path" do
+    path =
+      HTTP.query_path(
+        %{
+          "message" => "Привет, 世界 👋",
+          "count" => 9_007_199_254_740_993,
+          "decimal" => Decimal.new("1.2300"),
+          "date" => ~D[2026-08-14],
+          "naive" => ~N[2026-08-14 12:34:56],
+          "epoch" => ~U[1970-01-01 00:00:00Z],
+          "before_epoch" => ~U[1969-12-31 23:59:59Z],
+          "fractional" => ~U[1970-01-01 00:00:00.001Z],
+          "tags" => ["one", "O'Reilly"],
+          "tuple" => {1, true},
+          "map" => %{"key" => "value"},
+          "readonly" => 1
+        },
+        [
+          {"readonly", 1},
+          {"output_format_json_quote_64bit_integers", false}
+        ]
+      )
+
+    query = """
+    SELECT
+      ({message:String} = 'Привет, 世界 👋') AND
+      ({decimal:Decimal(5, 4)} = CAST('1.2300', 'Decimal(5, 4)')) AND
+      ({date:Date} = toDate('2026-08-14')) AND
+      ({naive:DateTime} = toDateTime('2026-08-14 12:34:56')) AND
+      ({epoch:DateTime} = toDateTime(0)) AND
+      ({before_epoch:DateTime64(0)} = toDateTime64('1969-12-31 23:59:59', 0)) AND
+      ({fractional:DateTime64(3)} = toDateTime64('1970-01-01 00:00:00.001', 3)) AND
+      ({tags:Array(String)} = ['one', 'O''Reilly']) AND
+      ({tuple:Tuple(UInt8, Bool)} = (1, true)) AND
+      ({map:Map(String, String)}['key'] = 'value') AND
+      ({readonly:UInt8} = 1) AS ok,
+      {count:UInt64} AS count
+    FORMAT JSONEachRow
+    """
+
+    assert %{status: 200, body: body} = request(path, query)
+    assert body == ~s({"ok":1,"count":9007199254740993}\n)
+  end
+
+  property "generated named parameters round-trip through ClickHouse" do
+    check all(
+            integer <- integer(-9_223_372_036_854_775_808..9_223_372_036_854_775_807),
+            string <- string([?\t, ?\n, ?\\, 32..126, 0x400..0x4FF], max_length: 32),
+            max_runs: 25
+          ) do
+      path = HTTP.query_path(%{"integer" => integer, "string" => string})
+      response = request(path, "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated")
+
+      assert %{status: 200, body: body} = response
+      assert body == "#{integer}\t#{Base.encode16(string)}\n"
+    end
+  end
+
+  defp request(path, body) do
+    {:ok, conn} = Mint.HTTP1.connect(:http, "localhost", 8123, mode: :passive)
+    {:ok, conn, ref} = Mint.HTTP1.request(conn, "POST", path, [{"expect", "100-continue"}], body)
+    {:ok, conn, response} = receive_response([], conn, ref, %{body: ""})
+    {:ok, _conn} = Mint.HTTP1.close(conn)
+    response
+  end
+
+  defp receive_response([], conn, ref, response) do
+    {:ok, conn, entries} = Mint.HTTP1.recv(conn, 0, to_timeout(second: 5))
+    receive_response(entries, conn, ref, response)
+  end
+
+  defp receive_response([entry | entries], conn, ref, response) do
+    case entry do
+      {:status, ^ref, status} ->
+        receive_response(entries, conn, ref, %{status: status, body: ""})
+
+      {:headers, ^ref, headers} ->
+        receive_response(entries, conn, ref, Map.put(response, :headers, headers))
+
+      {:data, ^ref, data} ->
+        receive_response(entries, conn, ref, Map.update!(response, :body, &(&1 <> data)))
+
+      {:done, ^ref} ->
+        {:ok, conn, response}
+
+      {:error, ^ref, error} ->
+        {:error, conn, error}
+    end
   end
 
   defp decode_query(target) do
