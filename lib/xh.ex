@@ -3,10 +3,10 @@ defmodule Xh do
   A small, raw ClickHouse HTTP/1 transport.
 
   Each pool is bound to the origin configured by `:url`. Connections are opened
-  lazily, used by one request at a time, and reused while they remain healthy.
+  lazily, used by one query at a time, and reused while they remain healthy.
 
-  `request/3` buffers the complete response. It is intended for small insert
-  acknowledgements, not large query results, and never retries a request.
+  `query/3` buffers the complete response. It is intended for small insert
+  acknowledgements, not large query results, and never retries a query.
   """
 
   @behaviour NimblePool
@@ -21,7 +21,7 @@ defmodule Xh do
     url: [
       type: {:custom, __MODULE__, :validate_url, []},
       default: "http://localhost:8123",
-      doc: "The HTTP or HTTPS endpoint. Its path prefixes request targets."
+      doc: "The HTTP or HTTPS endpoint. Its path prefixes query targets."
     ],
     pool_size: [
       type: :pos_integer,
@@ -43,8 +43,8 @@ defmodule Xh do
   @typedoc "Options accepted by `start_link/1`."
   @type start_option :: unquote(NimbleOptions.option_typespec(@start_options_schema))
 
-  @typedoc "A raw HTTP request. The target is relative to the path in the pool URL."
-  @type request ::
+  @typedoc "A raw HTTP query. The target is relative to the path in the pool URL."
+  @type query ::
           {method :: String.t(), target :: String.t(), Mint.Types.headers(), iodata() | nil}
 
   @typedoc "A fully buffered raw HTTP response."
@@ -117,18 +117,18 @@ defmodule Xh do
   end
 
   @doc """
-  Sends one raw request and buffers its complete response.
+  Executes one raw ClickHouse HTTP query and buffers its complete response.
 
   `timeout_or_deadline` is either a relative timeout or the absolute monotonic
   deadline returned by `Xh.HTTP.to_deadline/1`. The same deadline covers pool
-  checkout, connection establishment, request transmission, and response
+  checkout, connection establishment, query transmission, and response
   receipt.
 
-  The request is never retried. If its connection fails or times out, that
+  The query is never retried. If its connection fails or times out, that
   connection is closed and removed from the pool.
   """
-  @spec request(NimblePool.pool(), request(), timeout() | HTTP.deadline()) :: response()
-  def request(pool, {method, target, headers, body}, timeout_or_deadline)
+  @spec query(NimblePool.pool(), query(), timeout() | HTTP.deadline()) :: response()
+  def query(pool, {method, target, headers, body}, timeout_or_deadline)
       when is_binary(method) and is_binary(target) and is_list(headers) do
     deadline = HTTP.to_deadline(timeout_or_deadline)
     checkout_timeout = HTTP.to_timeout(deadline)
@@ -284,37 +284,16 @@ defmodule Xh do
   defp join_target(_base_path, target), do: target
 
   defp transmit(conn, method, target, headers, body, deadline) do
-    timeout = HTTP.to_timeout(deadline)
-
-    with :ok <- configure_send_timeout(conn, timeout) do
-      transmit_with_timeout(conn, method, target, headers, body, timeout)
-    else
-      {:error, reason} -> {:error, conn, reason}
-    end
-  end
-
-  defp transmit_with_timeout(conn, method, target, headers, body, :infinity) do
-    Mint.HTTP1.request(conn, method, target, headers, body)
-  end
-
-  defp transmit_with_timeout(conn, _method, _target, _headers, _body, 0) do
-    {:error, conn, timeout_error()}
-  end
-
-  defp transmit_with_timeout(conn, method, target, headers, body, timeout) do
-    task = Task.async(fn -> Mint.HTTP1.request(conn, method, target, headers, body) end)
-
-    case Task.yield(task, timeout) do
-      {:ok, result} ->
-        result
-
-      {:exit, reason} ->
-        exit(reason)
-
-      nil ->
-        _ = abort_connection(conn)
-        _ = Task.shutdown(task, :brutal_kill)
+    case HTTP.to_timeout(deadline) do
+      0 ->
         {:error, conn, timeout_error()}
+
+      timeout ->
+        with :ok <- configure_send_timeout(conn, timeout) do
+          Mint.HTTP1.request(conn, method, target, headers, body)
+        else
+          {:error, reason} -> {:error, conn, reason}
+        end
     end
   end
 

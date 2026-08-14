@@ -125,7 +125,7 @@ defmodule Xh.HTTPTest do
     target = HTTP.query_path(params, settings)
 
     {:ok, status, headers, body} =
-      Xh.request(pool, {"POST", target, [], statement}, to_timeout(second: 5))
+      Xh.query(pool, {"POST", target, [], statement}, to_timeout(second: 5))
 
     %{status: status, headers: headers, body: body}
   end

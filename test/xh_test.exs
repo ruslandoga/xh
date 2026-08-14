@@ -28,7 +28,7 @@ defmodule XhTest do
     first_port = clickhouse_client_port(pool)
 
     assert {:ok, 200, headers, body} =
-             Xh.request(
+             Xh.query(
                pool,
                {"POST", "/", [{"connection", "close"}], @client_port_query},
                @request_timeout
@@ -50,7 +50,7 @@ defmodule XhTest do
     first_port = clickhouse_client_port(pool)
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.request(pool, {"POST", "/", [], "SELECT sleep(0.2)"}, 20)
+             Xh.query(pool, {"POST", "/", [], "SELECT sleep(0.2)"}, 20)
 
     refute clickhouse_client_port(pool) == first_port
   end
@@ -79,14 +79,14 @@ defmodule XhTest do
 
     refute_receive {:accepted, ^server, _connection_id}, 50
 
-    first = request_async(pool, "/insert?batch=1")
+    first = query_async(pool, "/insert?batch=1")
 
     assert_receive {:accepted, ^server, 1}
     assert_receive {:request, ^server, 1, %{target: "/clickhouse/insert?batch=1"}}
     send(server, {:respond, 1, "first"})
     assert Task.await(first) == {:ok, 200, [{"x-test", "yes"}, {"content-length", "5"}], "first"}
 
-    second = request_async(pool, "/insert?batch=2")
+    second = query_async(pool, "/insert?batch=2")
 
     assert_receive {:request, ^server, 1, %{target: "/clickhouse/insert?batch=2"}}
     refute_receive {:accepted, ^server, 2}, 50
@@ -109,12 +109,12 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    failed = request_async(pool, "/closed")
+    failed = query_async(pool, "/closed")
     assert_receive {:request, ^server, 1, %{target: "/closed"}}
     send(server, {:close, 1})
     assert {:error, %Mint.TransportError{reason: :closed}} = Task.await(failed)
 
-    successful = request_async(pool, "/fresh")
+    successful = query_async(pool, "/fresh")
     assert_receive {:accepted, ^server, 2}
     assert_receive {:request, ^server, 2, %{target: "/fresh"}}
     send(server, {:respond, 2, "fresh"})
@@ -136,13 +136,13 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    failed = request_async(pool, "/timeout", 40)
+    failed = query_async(pool, "/timeout", 40)
     assert_receive {:request, ^server, 1, %{target: "/timeout"}}
     assert {:error, %Mint.TransportError{reason: :timeout}} = Task.await(failed)
     send(server, {:await_close, 1})
     assert_receive {:connection_closed, ^server, 1}
 
-    successful = request_async(pool, "/fresh")
+    successful = query_async(pool, "/fresh")
     assert_receive {:accepted, ^server, 2}
     assert_receive {:request, ^server, 2, %{target: "/fresh"}}
     send(server, {:respond, 2, "fresh"})
@@ -163,11 +163,11 @@ defmodule XhTest do
     {server, url} = start_server(handler)
     pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
 
-    checked_out = request_async(pool, "/held")
+    checked_out = query_async(pool, "/held")
     assert_receive {:request, ^server, 1, %{target: "/held"}}
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.request(pool, {"POST", "/queued", [], "payload"}, 20)
+             Xh.query(pool, {"POST", "/queued", [], "payload"}, 20)
 
     send(server, {:respond, 1, "done"})
     assert {:ok, 200, _headers, "done"} = Task.await(checked_out)
@@ -187,7 +187,7 @@ defmodule XhTest do
     started_at = System.monotonic_time(:millisecond)
 
     assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.request(pool, {"POST", "/stalled", [], body}, 40)
+             Xh.query(pool, {"POST", "/stalled", [], body}, 40)
 
     assert_receive {:accepted, ^server}
     assert System.monotonic_time(:millisecond) - started_at < 500
@@ -205,7 +205,7 @@ defmodule XhTest do
     {:ok, pool} = Xh.start_link(url: url, pool_size: 1, worker_idle_timeout: :infinity)
 
     assert {:ok, 204, _headers, ""} =
-             Xh.request(pool, {"POST", "/ack", [], "payload"}, @request_timeout)
+             Xh.query(pool, {"POST", "/ack", [], "payload"}, @request_timeout)
 
     assert_receive {:request, ^server, 1, %{target: "/ack", body: "payload"}}
     assert :ok = Xh.stop(pool)
@@ -238,16 +238,16 @@ defmodule XhTest do
     refute_receive {:accepted, ^server, _connection_id}, 20
 
     assert {:ok, 200, _headers, "named"} =
-             Xh.request(name, {"POST", "/named", [], ""}, @request_timeout)
+             Xh.query(name, {"POST", "/named", [], ""}, @request_timeout)
   end
 
-  defp request_async(pool, target, timeout \\ @request_timeout) do
-    Task.async(fn -> Xh.request(pool, {"POST", target, [], "payload"}, timeout) end)
+  defp query_async(pool, target, timeout \\ @request_timeout) do
+    Task.async(fn -> Xh.query(pool, {"POST", target, [], "payload"}, timeout) end)
   end
 
   defp clickhouse_client_port(pool) do
     assert {:ok, 200, _headers, body} =
-             Xh.request(pool, {"POST", "/", [], @client_port_query}, @request_timeout)
+             Xh.query(pool, {"POST", "/", [], @client_port_query}, @request_timeout)
 
     String.trim(body)
   end
