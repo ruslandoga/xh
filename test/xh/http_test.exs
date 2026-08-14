@@ -4,6 +4,11 @@ defmodule Xh.HTTPTest do
 
   alias Xh.HTTP
 
+  setup do
+    pool = start_supervised!({Xh, worker_idle_timeout: :infinity})
+    {:ok, pool: pool}
+  end
+
   test "builds query paths" do
     assert HTTP.query_path(%{}) == "/"
     assert HTTP.query_path(%{}, readonly: 1) == "/?readonly=1"
@@ -56,30 +61,8 @@ defmodule Xh.HTTPTest do
     assert HTTP.to_timeout({:deadline, System.monotonic_time(:millisecond) - 1}) == 0
   end
 
-  test "ClickHouse accepts the generated query path" do
-    path =
-      HTTP.query_path(
-        %{
-          "message" => "Привет, 世界 👋",
-          "count" => 9_007_199_254_740_993,
-          "decimal" => Decimal.new("1.2300"),
-          "date" => ~D[2026-08-14],
-          "naive" => ~N[2026-08-14 12:34:56],
-          "epoch" => ~U[1970-01-01 00:00:00Z],
-          "before_epoch" => ~U[1969-12-31 23:59:59Z],
-          "fractional" => ~U[1970-01-01 00:00:00.001Z],
-          "tags" => ["one", "O'Reilly"],
-          "tuple" => {1, true},
-          "map" => %{"key" => "value"},
-          "readonly" => 1
-        },
-        [
-          {"readonly", 1},
-          {"output_format_json_quote_64bit_integers", false}
-        ]
-      )
-
-    query = """
+  test "ClickHouse accepts the generated query path", %{pool: pool} do
+    statement = """
     SELECT
       ({message:String} = 'Привет, 世界 👋') AND
       ({decimal:Decimal(5, 4)} = CAST('1.2300', 'Decimal(5, 4)')) AND
@@ -96,54 +79,55 @@ defmodule Xh.HTTPTest do
     FORMAT JSONEachRow
     """
 
-    assert %{status: 200, body: body} = request(path, query)
+    params = %{
+      "message" => "Привет, 世界 👋",
+      "count" => 9_007_199_254_740_993,
+      "decimal" => Decimal.new("1.2300"),
+      "date" => ~D[2026-08-14],
+      "naive" => ~N[2026-08-14 12:34:56],
+      "epoch" => ~U[1970-01-01 00:00:00Z],
+      "before_epoch" => ~U[1969-12-31 23:59:59Z],
+      "fractional" => ~U[1970-01-01 00:00:00.001Z],
+      "tags" => ["one", "O'Reilly"],
+      "tuple" => {1, true},
+      "map" => %{"key" => "value"},
+      "readonly" => 1
+    }
+
+    settings = [
+      {"readonly", 1},
+      {"output_format_json_quote_64bit_integers", false}
+    ]
+
+    assert %{status: 200, body: body} = query(pool, statement, params, settings)
     assert body == ~s({"ok":1,"count":9007199254740993}\n)
   end
 
-  property "generated named parameters round-trip through ClickHouse" do
+  property "generated named parameters round-trip through ClickHouse", %{pool: pool} do
     check all(
             integer <- integer(-9_223_372_036_854_775_808..9_223_372_036_854_775_807),
             string <- string([?\t, ?\n, ?\\, 32..126, 0x400..0x4FF], max_length: 32),
             max_runs: 25
           ) do
-      path = HTTP.query_path(%{"integer" => integer, "string" => string})
-      response = request(path, "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated")
+      response =
+        query(
+          pool,
+          "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated",
+          %{"integer" => integer, "string" => string}
+        )
 
       assert %{status: 200, body: body} = response
       assert body == "#{integer}\t#{Base.encode16(string)}\n"
     end
   end
 
-  defp request(path, body) do
-    {:ok, conn} = Mint.HTTP1.connect(:http, "localhost", 8123, mode: :passive)
-    {:ok, conn, ref} = Mint.HTTP1.request(conn, "POST", path, [{"expect", "100-continue"}], body)
-    {:ok, conn, response} = receive_response([], conn, ref, %{body: ""})
-    {:ok, _conn} = Mint.HTTP1.close(conn)
-    response
-  end
+  defp query(pool, statement, params, settings \\ []) do
+    target = HTTP.query_path(params, settings)
 
-  defp receive_response([], conn, ref, response) do
-    {:ok, conn, entries} = Mint.HTTP1.recv(conn, 0, to_timeout(second: 5))
-    receive_response(entries, conn, ref, response)
-  end
+    {:ok, status, headers, body} =
+      Xh.request(pool, {"POST", target, [], statement}, to_timeout(second: 5))
 
-  defp receive_response([entry | entries], conn, ref, response) do
-    case entry do
-      {:status, ^ref, status} ->
-        receive_response(entries, conn, ref, %{status: status, body: ""})
-
-      {:headers, ^ref, headers} ->
-        receive_response(entries, conn, ref, Map.put(response, :headers, headers))
-
-      {:data, ^ref, data} ->
-        receive_response(entries, conn, ref, Map.update!(response, :body, &(&1 <> data)))
-
-      {:done, ^ref} ->
-        {:ok, conn, response}
-
-      {:error, ^ref, error} ->
-        {:error, conn, error}
-    end
+    %{status: status, headers: headers, body: body}
   end
 
   defp decode_query(target) do
