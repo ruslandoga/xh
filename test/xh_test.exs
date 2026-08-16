@@ -8,7 +8,7 @@ defmodule XhTest do
   test "real ClickHouse queries reuse the same HTTP connection" do
     pool =
       start_supervised!(
-        {Xh, url: @clickhouse_url, pool_size: 1, worker_idle_timeout: :infinity},
+        {Xh, url: @clickhouse_url, max_conns: 1, worker_idle_timeout: :infinity},
         id: make_ref()
       )
 
@@ -21,7 +21,7 @@ defmodule XhTest do
   test "a connection closed by real ClickHouse is replaced" do
     pool =
       start_supervised!(
-        {Xh, url: @clickhouse_url, pool_size: 1, worker_idle_timeout: :infinity},
+        {Xh, url: @clickhouse_url, max_conns: 1, worker_idle_timeout: :infinity},
         id: make_ref()
       )
 
@@ -42,7 +42,7 @@ defmodule XhTest do
   test "a timed-out real ClickHouse query is removed before the next query" do
     pool =
       start_supervised!(
-        {Xh, url: @clickhouse_url, pool_size: 1, worker_idle_timeout: :infinity},
+        {Xh, url: @clickhouse_url, max_conns: 1, worker_idle_timeout: :infinity},
         id: make_ref()
       )
 
@@ -70,10 +70,7 @@ defmodule XhTest do
     pool =
       start_supervised!(
         {Xh,
-         url: url <> "/clickhouse",
-         pool_size: 1,
-         worker_idle_timeout: :infinity,
-         transport_opts: [nodelay: true]}
+         url: url, max_conns: 1, worker_idle_timeout: :infinity, transport_opts: [nodelay: true]}
       )
 
     refute_receive {:accepted, ^server, _connection_id}, 50
@@ -86,7 +83,7 @@ defmodule XhTest do
     assert_receive {:request, ^server, 1,
                     %{
                       method: "POST",
-                      target: "/clickhouse/?batch=1",
+                      target: "/?batch=1",
                       body: "INSERT INTO events FORMAT CSV\n1,first\n"
                     }}
 
@@ -95,7 +92,7 @@ defmodule XhTest do
 
     second = query_async(pool, "second", settings: [batch: 2])
 
-    assert_receive {:request, ^server, 1, %{target: "/clickhouse/?batch=2", body: "second"}}
+    assert_receive {:request, ^server, 1, %{target: "/?batch=2", body: "second"}}
 
     refute_receive {:accepted, ^server, 2}, 50
     send(server, {:respond, 1, "second"})
@@ -115,7 +112,7 @@ defmodule XhTest do
     end
 
     {server, url} = start_server(handler)
-    pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
+    pool = start_supervised!({Xh, url: url, max_conns: 1, worker_idle_timeout: :infinity})
 
     failed = query_async(pool, "closed")
     assert_receive {:request, ^server, 1, %{target: "/", body: "closed"}}
@@ -142,7 +139,7 @@ defmodule XhTest do
     end
 
     {server, url} = start_server(handler)
-    pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
+    pool = start_supervised!({Xh, url: url, max_conns: 1, worker_idle_timeout: :infinity})
 
     failed = query_async(pool, "timeout", timeout: 40)
     assert_receive {:request, ^server, 1, %{target: "/", body: "timeout"}}
@@ -157,7 +154,7 @@ defmodule XhTest do
     assert {:ok, 200, _headers, "fresh"} = Task.await(successful)
   end
 
-  test "pool checkout timeout is returned as a transport error" do
+  test "pool checkout timeout exits without sending a query" do
     test_process = self()
 
     handler = fn connection_id, request ->
@@ -169,13 +166,15 @@ defmodule XhTest do
     end
 
     {server, url} = start_server(handler)
-    pool = start_supervised!({Xh, url: url, pool_size: 1, worker_idle_timeout: :infinity})
+    pool = start_supervised!({Xh, url: url, max_conns: 1, worker_idle_timeout: :infinity})
 
     checked_out = query_async(pool, "held")
     assert_receive {:request, ^server, 1, %{target: "/", body: "held"}}
 
-    assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.query(pool, "queued", %{}, timeout: 20)
+    queued = Task.async(fn -> catch_exit(Xh.query(pool, "queued", %{}, timeout: 20)) end)
+
+    assert {:timeout, {NimblePool, checkout, _arguments}} = Task.await(queued)
+    assert checkout in [:checkout, :checkout!]
 
     send(server, {:respond, 1, "done"})
     assert {:ok, 200, _headers, "done"} = Task.await(checked_out)
@@ -188,7 +187,7 @@ defmodule XhTest do
     pool =
       start_supervised!(
         {Xh,
-         url: url, pool_size: 1, worker_idle_timeout: :infinity, transport_opts: [sndbuf: 1_024]}
+         url: url, max_conns: 1, worker_idle_timeout: :infinity, transport_opts: [sndbuf: 1_024]}
       )
 
     body = :binary.copy(<<0>>, 4 * 1_024 * 1_024)
@@ -210,7 +209,7 @@ defmodule XhTest do
     end
 
     {server, url} = start_server(handler)
-    {:ok, pool} = Xh.start_link(url: url, pool_size: 1, worker_idle_timeout: :infinity)
+    {:ok, pool} = Xh.start_link(url: url, max_conns: 1, worker_idle_timeout: :infinity)
 
     assert {:ok, 204, _headers, ""} =
              Xh.query(pool, "payload", %{}, timeout: @query_timeout)
@@ -221,9 +220,19 @@ defmodule XhTest do
   end
 
   test "start options are validated" do
-    assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(pool_size: 0) end
+    assert {:ok, "http://localhost:8123/"} = Xh.validate_url("http://localhost:8123/")
+    assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(max_conns: 0) end
     assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(transport_opts: :invalid) end
     assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(url: "ftp://localhost") end
+
+    assert_raise NimbleOptions.ValidationError, fn ->
+      Xh.start_link(url: "http://localhost:8123/clickhouse")
+    end
+
+    assert_raise NimbleOptions.ValidationError, fn ->
+      Xh.start_link(url: "http://user:password@localhost:8123")
+    end
+
     assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(name: "invalid") end
     assert_raise NimbleOptions.ValidationError, fn -> Xh.start_link(unknown: true) end
   end

@@ -15,6 +15,10 @@ time, and removed after timeouts, transport failures, or closure. One absolute
 deadline covers the pool checkout and network work. Queries are never retried
 internally.
 
+A pool-checkout timeout exits the caller. It is deliberately not caught and
+converted into an error tuple, which could leave a racing checkout reply in the
+caller's mailbox.
+
 `Xh.query/2` buffers the complete response in memory. This initial transport
 targets small insert acknowledgements; it is not intended for large query
 results.
@@ -24,6 +28,6 @@ accepts `:headers`, ClickHouse `:settings`, and a `:timeout` that defaults to 30
 seconds. Statements may be iodata, so encoded insert rows can follow the SQL
 without first being concatenated into a new binary.
 
-Pool options include `:name`, `:url`, `:pool_size`, `:worker_idle_timeout`, and
-`:transport_opts` passed to Mint. A URL path prefixes each query target, while
-the scheme, host, and port bind the pool to a single origin.
+Pool options include `:name`, `:url`, `:max_conns`, `:worker_idle_timeout`, and
+`:transport_opts` passed to Mint. The URL is an unauthenticated HTTP(S) origin;
+non-root paths, userinfo, query strings, and fragments are rejected.

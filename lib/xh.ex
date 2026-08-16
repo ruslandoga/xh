@@ -23,9 +23,9 @@ defmodule Xh do
     url: [
       type: {:custom, __MODULE__, :validate_url, []},
       default: "http://localhost:8123",
-      doc: "The HTTP or HTTPS endpoint. Its path prefixes query targets."
+      doc: "The HTTP or HTTPS origin. Authentication is not yet supported."
     ],
-    pool_size: [
+    max_conns: [
       type: :pos_integer,
       default: 20,
       doc: "The maximum number of concurrent HTTP/1 connections."
@@ -75,13 +75,15 @@ defmodule Xh do
     with {:ok, uri} <- URI.new(url),
          true <- uri.scheme in ["http", "https"],
          true <- is_binary(uri.host) and uri.host != "",
+         true <- is_nil(uri.userinfo),
+         true <- uri.path in [nil, "", "/"],
          true <- is_nil(uri.query),
          true <- is_nil(uri.fragment) do
       {:ok, url}
     else
       _ ->
         {:error,
-         "expected an HTTP(S) URL with a host and without a query or fragment, got: #{inspect(url)}"}
+         "expected an HTTP(S) origin with neither userinfo, a non-root path, a query, nor a fragment, got: #{inspect(url)}"}
     end
   end
 
@@ -107,7 +109,7 @@ defmodule Xh do
 
     NimblePool.start_link(
       worker: {__MODULE__, endpoint},
-      pool_size: Keyword.fetch!(options, :pool_size),
+      pool_size: Keyword.fetch!(options, :max_conns),
       worker_idle_timeout: worker_idle_timeout,
       lazy: true,
       name: Keyword.get(options, :name)
@@ -140,6 +142,10 @@ defmodule Xh do
   The same deadline covers pool checkout, connection establishment, query
   transmission, and response receipt.
 
+  If pool checkout exceeds the deadline, this function exits with NimblePool's
+  timeout. The exit is intentionally not converted into an error tuple because
+  a late checkout reply could otherwise remain in the caller's mailbox.
+
   The query is never retried. If its connection fails or times out, that
   connection is closed and removed from the pool.
   """
@@ -150,41 +156,35 @@ defmodule Xh do
     target = HTTP.query_path(params, Keyword.get(options, :settings, []))
     headers = Keyword.get(options, :headers, [])
     timeout_or_deadline = Keyword.get(options, :timeout, @query_timeout)
-
-    execute(pool, target, headers, statement, timeout_or_deadline)
-  end
-
-  defp execute(pool, target, headers, body, timeout_or_deadline) do
     deadline = HTTP.to_deadline(timeout_or_deadline)
-    checkout_timeout = HTTP.to_timeout(deadline)
 
-    try do
-      NimblePool.checkout!(
-        pool,
-        :request,
-        fn from, conn_or_endpoint ->
-          case exchange(from, conn_or_endpoint, "POST", target, headers, body, deadline) do
-            {:ok, conn, status, response_headers, response_body} ->
-              state =
-                if Mint.HTTP1.open?(conn) do
-                  {:checkin, conn}
-                else
-                  {:remove, Mint.TransportError.exception(reason: :closed)}
-                end
+    NimblePool.checkout!(
+      pool,
+      :request,
+      fn from, conn_or_endpoint ->
+        case ensure_connected(from, conn_or_endpoint, deadline) do
+          {:ok, conn} ->
+            case request(conn, target, headers, statement, deadline) do
+              {:ok, conn, status, response_headers, response_body} ->
+                state =
+                  if Mint.HTTP1.open?(conn) do
+                    {:checkin, conn}
+                  else
+                    {:remove, Mint.TransportError.exception(reason: :closed)}
+                  end
 
-              {{:ok, status, response_headers, response_body}, state}
+                {{:ok, status, response_headers, response_body}, state}
 
-            {:error, reason} ->
-              {{:error, reason}, {:remove, reason}}
-          end
-        end,
-        checkout_timeout
-      )
-    catch
-      :exit, {:timeout, {NimblePool, checkout, _arguments}}
-      when checkout in [:checkout, :checkout!] ->
-        {:error, timeout_error()}
-    end
+              {:error, reason} ->
+                {{:error, reason}, {:remove, reason}}
+            end
+
+          {:error, reason} ->
+            {{:error, reason}, {:remove, reason}}
+        end
+      end,
+      HTTP.to_timeout(deadline)
+    )
   end
 
   @impl NimblePool
@@ -228,31 +228,18 @@ defmodule Xh do
   end
 
   defp endpoint(url, transport_opts) do
-    %URI{scheme: scheme, host: host, port: port, path: path} = URI.parse(url)
+    %URI{scheme: scheme, host: host, port: port} = URI.parse(url)
 
     %{
       scheme: String.to_existing_atom(scheme),
       host: host,
       port: port,
-      path: normalize_base_path(path),
       transport_opts: transport_opts
     }
   end
 
-  defp normalize_base_path(path) when path in [nil, "", "/"], do: ""
-  defp normalize_base_path(path), do: String.trim_trailing(path, "/")
-
-  defp exchange(from, conn_or_endpoint, method, target, headers, body, deadline) do
-    with {:ok, conn} <- connect(from, conn_or_endpoint, deadline),
-         {:ok, conn, ref} <-
-           transmit(
-             conn,
-             method,
-             request_target(conn_or_endpoint, target),
-             headers,
-             body,
-             deadline
-           ),
+  defp request(conn, target, headers, body, deadline) do
+    with {:ok, conn, ref} <- transmit(conn, target, headers, body, deadline),
          {:ok, conn, status, response_headers, response_body} <-
            receive_response(conn, ref, deadline),
          :ok <- restore_transport_options(conn) do
@@ -261,13 +248,10 @@ defmodule Xh do
       {:error, conn, reason} ->
         _ = abort_connection(conn)
         {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
-  defp connect(from, {:connect, endpoint}, deadline) do
+  defp ensure_connected(from, {:connect, endpoint}, deadline) do
     timeout = HTTP.to_timeout(deadline)
 
     transport_opts =
@@ -297,25 +281,16 @@ defmodule Xh do
     end
   end
 
-  defp connect(_from, {:connected, conn}, _deadline), do: {:ok, conn}
+  defp ensure_connected(_from, {:connected, conn}, _deadline), do: {:ok, conn}
 
-  defp request_target({:connect, endpoint}, target), do: join_target(endpoint.path, target)
-
-  defp request_target({:connected, conn}, target),
-    do: join_target(Mint.HTTP1.get_private(conn, :xh_endpoint).path, target)
-
-  defp join_target("", target), do: target
-  defp join_target(base_path, "/" <> _ = target), do: base_path <> target
-  defp join_target(_base_path, target), do: target
-
-  defp transmit(conn, method, target, headers, body, deadline) do
+  defp transmit(conn, target, headers, body, deadline) do
     case HTTP.to_timeout(deadline) do
       0 ->
         {:error, conn, timeout_error()}
 
       timeout ->
         with :ok <- configure_send_timeout(conn, timeout) do
-          Mint.HTTP1.request(conn, method, target, headers, body)
+          Mint.HTTP1.request(conn, "POST", target, headers, body)
         else
           {:error, reason} -> {:error, conn, reason}
         end
