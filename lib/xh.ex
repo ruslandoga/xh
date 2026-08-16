@@ -151,8 +151,7 @@ defmodule Xh do
   """
   @spec query(NimblePool.pool(), query_statement(), query_params(), [query_option()]) ::
           response()
-  def query(pool, statement, params \\ %{}, options \\ [])
-      when (is_binary(statement) or is_list(statement)) and is_map(params) and is_list(options) do
+  def query(pool, statement, params \\ %{}, options \\ []) do
     target = HTTP.query_path(params, Keyword.get(options, :settings, []))
     headers = Keyword.get(options, :headers, [])
     timeout_or_deadline = Keyword.get(options, :timeout, @query_timeout)
