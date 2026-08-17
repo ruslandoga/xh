@@ -11,6 +11,8 @@ defmodule Xh do
 
   @behaviour NimblePool
 
+  @dialyzer :no_improper_lists
+
   alias Xh.HTTP
 
   @query_timeout to_timeout(second: 30)
@@ -99,27 +101,37 @@ defmodule Xh do
   @spec start_link([start_option]) :: GenServer.on_start()
   def start_link(options \\ []) do
     options = NimbleOptions.validate!(options, @start_options_schema)
-    endpoint = endpoint(Keyword.fetch!(options, :url), Keyword.fetch!(options, :transport_opts))
+    name = Keyword.get(options, :name)
+    url = Keyword.fetch!(options, :url)
+    max_conns = Keyword.fetch!(options, :max_conns)
+    worker_idle_timeout = Keyword.fetch!(options, :worker_idle_timeout)
+    transport_opts = Keyword.fetch!(options, :transport_opts)
 
-    worker_idle_timeout =
-      case Keyword.fetch!(options, :worker_idle_timeout) do
-        :infinity -> nil
-        timeout -> timeout
-      end
+    %URI{scheme: scheme, host: host, port: port} = URI.parse(url)
+
+    endpoint = %{
+      scheme: String.to_existing_atom(scheme),
+      host: host,
+      port: port,
+      transport_opts: transport_opts
+    }
+
+    worker_idle_timeout = if worker_idle_timeout == :infinity, do: nil, else: worker_idle_timeout
 
     NimblePool.start_link(
       worker: {__MODULE__, endpoint},
-      pool_size: Keyword.fetch!(options, :max_conns),
+      pool_size: max_conns,
       worker_idle_timeout: worker_idle_timeout,
       lazy: true,
-      name: Keyword.get(options, :name)
+      name: name
     )
   end
 
-  @doc "Returns a child specification for a pool."
+  @doc "Returns a child specification for a pool. See `start_link/1` for supported options."
   @spec child_spec([start_option]) :: Supervisor.child_spec()
   def child_spec(options) do
-    %{id: Keyword.get(options, :name, __MODULE__), start: {__MODULE__, :start_link, [options]}}
+    id = Keyword.get(options, :name, __MODULE__)
+    %{id: id, start: {__MODULE__, :start_link, [options]}}
   end
 
   @doc "Stops a pool."
@@ -139,8 +151,9 @@ defmodule Xh do
     * `:timeout` - A relative timeout or absolute monotonic deadline; defaults
       to 30 seconds.
 
-  The same deadline covers pool checkout, connection establishment, query
-  transmission, and response receipt.
+  The same deadline covers pool checkout, connection establishment, and
+  response receipt. Request transmission uses Mint's transport behavior and
+  the configured transport options.
 
   If pool checkout exceeds the deadline, this function exits with NimblePool's
   timeout. The exit is intentionally not converted into an error tuple because
@@ -219,33 +232,21 @@ defmodule Xh do
   def handle_ping(_conn, _endpoint), do: {:remove, :worker_idle_timeout}
 
   @impl NimblePool
-  def terminate_worker(_reason, :disconnected, endpoint), do: {:ok, endpoint}
-
+  @dialyzer {:nowarn_function, terminate_worker: 3}
+  @spec terminate_worker(term(), :disconnected | Mint.HTTP1.t(), map()) :: {:ok, map()}
   def terminate_worker(_reason, conn, endpoint) do
-    _ = Mint.HTTP1.close(conn)
+    with %Mint.HTTP1{} <- conn, do: Mint.HTTP1.close(conn)
     {:ok, endpoint}
   end
 
-  defp endpoint(url, transport_opts) do
-    %URI{scheme: scheme, host: host, port: port} = URI.parse(url)
-
-    %{
-      scheme: String.to_existing_atom(scheme),
-      host: host,
-      port: port,
-      transport_opts: transport_opts
-    }
-  end
-
   defp request(conn, target, headers, body, deadline) do
-    with {:ok, conn, ref} <- transmit(conn, target, headers, body, deadline),
+    with {:ok, conn, ref} <- Mint.HTTP1.request(conn, "POST", target, headers, body),
          {:ok, conn, status, response_headers, response_body} <-
-           receive_response(conn, ref, deadline),
-         :ok <- restore_transport_options(conn) do
+           receive_response(conn, ref, deadline) do
       {:ok, conn, status, response_headers, response_body}
     else
       {:error, conn, reason} ->
-        _ = abort_connection(conn)
+        _ = Mint.HTTP1.close(conn)
         {:error, reason}
     end
   end
@@ -282,79 +283,6 @@ defmodule Xh do
 
   defp ensure_connected(_from, {:connected, conn}, _deadline), do: {:ok, conn}
 
-  defp transmit(conn, target, headers, body, deadline) do
-    case HTTP.to_timeout(deadline) do
-      0 ->
-        {:error, conn, timeout_error()}
-
-      timeout ->
-        with :ok <- configure_send_timeout(conn, timeout) do
-          Mint.HTTP1.request(conn, "POST", target, headers, body)
-        else
-          {:error, reason} -> {:error, conn, reason}
-        end
-    end
-  end
-
-  defp configure_send_timeout(conn, deadline_timeout) do
-    endpoint = Mint.HTTP1.get_private(conn, :xh_endpoint)
-    configured_timeout = Keyword.get(endpoint.transport_opts, :send_timeout, :infinity)
-    send_timeout = min_timeout(deadline_timeout, configured_timeout)
-
-    send_timeout_close =
-      deadline_timeout != :infinity or
-        Keyword.get(endpoint.transport_opts, :send_timeout_close, false)
-
-    options = [send_timeout: send_timeout, send_timeout_close: send_timeout_close]
-
-    linger =
-      if deadline_timeout == :infinity,
-        do: Keyword.get(endpoint.transport_opts, :linger, {false, 0}),
-        else: {true, 0}
-
-    options = Keyword.put(options, :linger, linger)
-    socket = Mint.HTTP1.get_socket(conn)
-
-    result =
-      case endpoint.scheme do
-        :http -> :inet.setopts(socket, options)
-        :https -> :ssl.setopts(socket, options)
-      end
-
-    case result do
-      :ok -> :ok
-      {:error, reason} -> {:error, Mint.TransportError.exception(reason: reason)}
-    end
-  end
-
-  defp min_timeout(:infinity, configured), do: configured
-  defp min_timeout(deadline, :infinity), do: deadline
-  defp min_timeout(deadline, configured), do: min(deadline, configured)
-
-  defp restore_transport_options(conn) do
-    if Mint.HTTP1.open?(conn) do
-      case configure_send_timeout(conn, :infinity) do
-        :ok -> :ok
-        {:error, reason} -> {:error, conn, reason}
-      end
-    else
-      :ok
-    end
-  end
-
-  defp abort_connection(conn) do
-    endpoint = Mint.HTTP1.get_private(conn, :xh_endpoint)
-    socket = Mint.HTTP1.get_socket(conn)
-
-    _ =
-      case endpoint.scheme do
-        :http -> :inet.setopts(socket, linger: {true, 0})
-        :https -> :ssl.setopts(socket, linger: {true, 0})
-      end
-
-    Mint.HTTP1.close(conn)
-  end
-
   defp receive_response(conn, ref, deadline) do
     receive_response(conn, ref, nil, [], [], deadline)
   end
@@ -364,7 +292,7 @@ defmodule Xh do
       {:ok, conn, responses} ->
         case reduce_responses(responses, ref, status, headers, body) do
           {:done, status, headers, body} ->
-            {:ok, conn, status, headers, body |> Enum.reverse() |> IO.iodata_to_binary()}
+            {:ok, conn, status, headers, IO.iodata_to_binary(body)}
 
           {:more, status, headers, body} ->
             receive_response(conn, ref, status, headers, body, deadline)
@@ -387,7 +315,7 @@ defmodule Xh do
   end
 
   defp reduce_responses([{:data, ref, data} | responses], ref, status, headers, body) do
-    reduce_responses(responses, ref, status, headers, [data | body])
+    reduce_responses(responses, ref, status, headers, [body | data])
   end
 
   defp reduce_responses([{:done, ref} | _responses], ref, status, headers, body) do
@@ -401,6 +329,4 @@ defmodule Xh do
   defp reduce_responses([], _ref, status, headers, body) do
     {:more, status, headers, body}
   end
-
-  defp timeout_error, do: Mint.TransportError.exception(reason: :timeout)
 end

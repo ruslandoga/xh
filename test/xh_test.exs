@@ -181,25 +181,6 @@ defmodule XhTest do
     refute_receive {:request, ^server, _connection_id, %{body: "queued"}}, 50
   end
 
-  test "the deadline bounds request transmission" do
-    {server, url} = start_stalled_server()
-
-    pool =
-      start_supervised!(
-        {Xh,
-         url: url, max_conns: 1, worker_idle_timeout: :infinity, transport_opts: [sndbuf: 1_024]}
-      )
-
-    body = :binary.copy(<<0>>, 4 * 1_024 * 1_024)
-    started_at = System.monotonic_time(:millisecond)
-
-    assert {:error, %Mint.TransportError{reason: :timeout}} =
-             Xh.query(pool, body, %{}, timeout: 40)
-
-    assert_receive {:accepted, ^server}
-    assert System.monotonic_time(:millisecond) - started_at < 500
-  end
-
   test "stopping the pool closes an idle worker connection" do
     test_process = self()
 
@@ -285,40 +266,6 @@ defmodule XhTest do
 
       if Process.alive?(server) do
         Process.exit(server, :shutdown)
-      end
-    end)
-
-    {server, "http://localhost:#{port}"}
-  end
-
-  defp start_stalled_server do
-    {:ok, listener} =
-      :gen_tcp.listen(0, [
-        :binary,
-        packet: :raw,
-        active: false,
-        reuseaddr: true,
-        recbuf: 1_024
-      ])
-
-    {:ok, {_address, port}} = :inet.sockname(listener)
-    test_process = self()
-
-    server =
-      spawn_link(fn ->
-        {:ok, socket} = :gen_tcp.accept(listener)
-        send(test_process, {:accepted, self()})
-
-        receive do
-          :close -> :gen_tcp.close(socket)
-        end
-      end)
-
-    on_exit(fn ->
-      :gen_tcp.close(listener)
-
-      if Process.alive?(server) do
-        send(server, :close)
       end
     end)
 

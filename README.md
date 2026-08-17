@@ -12,8 +12,9 @@ single-origin pool of passive Mint HTTP/1 connections:
 
 Connections are opened only when a query checks one out, reused one query at a
 time, and removed after timeouts, transport failures, or closure. One absolute
-deadline covers the pool checkout and network work. Queries are never retried
-internally.
+deadline covers pool checkout, connection establishment, and response receipt;
+request transmission follows Mint's transport behavior. Queries are never
+retried internally.
 
 A pool-checkout timeout exits the caller. It is deliberately not caught and
 converted into an error tuple, which could leave a racing checkout reply in the
