@@ -5,7 +5,7 @@ defmodule Xh.HTTPTest do
   alias Xh.HTTP
 
   setup do
-    pool = start_supervised!({Xh, worker_idle_timeout: :infinity})
+    pool = start_supervised!(Xh)
     {:ok, pool: pool}
   end
 
