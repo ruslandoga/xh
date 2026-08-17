@@ -100,12 +100,9 @@ defmodule Xh.HTTPTest do
     ]
 
     assert {:ok, 200, _headers, body} =
-             Xh.query(pool, statement, params,
-               settings: settings,
-               timeout: to_timeout(second: 5)
-             )
+             Xh.query(pool, statement, params, settings: settings)
 
-    assert body == ~s({"ok":1,"count":9007199254740993}\n)
+    assert JSON.decode!(body) == %{"ok" => 1, "count" => 9_007_199_254_740_993}
   end
 
   property "generated named parameters round-trip through ClickHouse", %{pool: pool} do
@@ -117,12 +114,14 @@ defmodule Xh.HTTPTest do
       assert {:ok, 200, _headers, body} =
                Xh.query(
                  pool,
-                 "SELECT {integer:Int64}, hex({string:String}) FORMAT TabSeparated",
-                 %{"integer" => integer, "string" => string},
-                 timeout: to_timeout(second: 5)
+                 "SELECT toString({integer:Int64}) AS integer, hex({string:String}) AS string FORMAT JSONEachRow",
+                 %{"integer" => integer, "string" => string}
                )
 
-      assert body == "#{integer}\t#{Base.encode16(string)}\n"
+      assert JSON.decode!(body) == %{
+               "integer" => Integer.to_string(integer),
+               "string" => Base.encode16(string)
+             }
     end
   end
 
